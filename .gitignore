@@ -21,3 +21,7 @@ logs
 
 # Data folder
 bookcorpus_data/
+examples_deepspeed/sequence_parallel/data
+
+# Output folder
+examples_deepspeed/sequence_parallel/output

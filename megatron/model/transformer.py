@@ -36,9 +36,12 @@ except ImportError:
 try:
     # FlashAttention (1.x)
     from flash_attn.flash_attn_interface import flash_attn_unpadded_func
-    from flash_attn.flash_attn_triton import flash_attn_func
 except ImportError:
     flash_attn_unpadded_func = None
+    
+try:
+    from flash_attn.flash_attn_triton import flash_attn_func
+except ImportError:
     flash_attn_func = None
 
 try:
