@@ -139,7 +139,7 @@ lr_decay_style="cosine"
 mp_size=1
 
 ## Sequence parallelism, 1 is no SP
-sp_size=4
+sp_size=2
 
 ## Pipeline parallelism. To disable PP, set pp_size to 1 and no_pp to true.
 ## Note that currently both curriculum learning and random-LTD are NOT
