@@ -57,13 +57,16 @@ def parse_args(extra_args_provider=None, ignore_unknown_args=False):
     else:
         args = parser.parse_args()
 
+    # helper argument to set deepspeed pipeline parallel or not
+    args.ds_pipeline_enabled = not args.no_pipeline_parallel
+
     # Args from environment
     args.rank = int(os.getenv('RANK', '0'))
     args.world_size = int(os.getenv("WORLD_SIZE", '1'))
 
     return args
 
-def validate_args(args):
+def validate_args(args, defaults={}):
     # Tensor model parallel size.
     args.tensor_model_parallel_size = min(
         args.tensor_model_parallel_size, args.world_size)
@@ -135,7 +138,20 @@ def validate_args(args):
         args.recompute_granularity = 'selective'
     del args.recompute_activations
 
-    args.ds_pipeline_enabled = not args.no_pipeline_parallel
+    # Set input defaults.
+    for key in defaults:
+        # For default to be valid, it should not be provided in the
+        # arguments that are passed to the program. We check this by
+        # ensuring the arg is set to None.
+        if getattr(args, key) is not None:
+            if args.rank == 0:
+                print('WARNING: overriding default arguments for {key}:{v} \
+                       with {key}:{v2}'.format(key=key, v=defaults[key],
+                                               v2=getattr(args, key)),
+                                               flush=True)
+        else:
+            setattr(args, key, defaults[key])
+
     # Batch size.
     assert args.micro_batch_size is not None
     assert args.micro_batch_size > 0
@@ -405,7 +421,7 @@ def validate_args(args):
     args.compression_training = False
 
     # FlashAttention
-    args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2
+    args.use_flash_attn = args.use_flash_attn_v1 or args.use_flash_attn_triton or args.use_flash_attn_v2 or args.use_flash_attn_builder
 
     # AML
     if args.aml_data_download_path is not None:
@@ -607,6 +623,9 @@ def _add_network_size_args(parser):
                        'This is the size of position embedding.')
     group.add_argument('--use-rotary-position-embeddings', action='store_true',
                        help='Use rotary positional embeddings or not')
+    group.add_argument('--rotary-position-embeddings-theta', type=int, default=10000,
+                       help='Rotary positional embeddings theta value.',
+                       dest='rope_theta')
     group.add_argument('--rotary-percent', type=float, default=1.0,
                        help='Percent of rotary dimension to use, default 100%')
     group.add_argument('--no-position-embedding',
@@ -880,6 +899,9 @@ def _add_training_args(parser):
     group.add_argument('--create-moe-param-group', action='store_true',
                        help='Create separate groups for MoE params.'
                        'This is necessary for techniques like ZeRO.')
+    group.add_argument('--disable-moe-top2-2nd-expert-sampling', action='store_false',
+                       help='Disable MoE top2 sampling of the 2nd expert. Instead of sampling, use argmax.',
+                       dest='moe_top2_2nd_expert_sampling')
     group.add_argument('--use-flash-attn', '--use-flash-attn-v1', dest='use_flash_attn_v1', action='store_true',
                        help='use first version FlashAttention implementation of attention. '
                        'https://arxiv.org/abs/2205.14135')
@@ -888,6 +910,8 @@ def _add_training_args(parser):
                        'https://arxiv.org/abs/2307.08691')
     group.add_argument('--use-flash-attn-triton', action='store_true',
                        help='use FlashAttention implementation of attention using Triton.')
+    group.add_argument('--use-flash-attn-builder', action='store_true',
+                       help='use FlashAttention op builder.')
     group.add_argument('--disable-bias-linear', action='store_false',
                        help='Disable bias in the linear layers',
                        dest='add_bias_linear')
@@ -903,6 +927,8 @@ def _add_training_args(parser):
                        help='Run optimizer on CPU')
     group.add_argument('--cpu_torch_adam', action='store_true',
                        help='Use Torch Adam as optimizer on CPU.')
+    group.add_argument('--ds_fused_adam', action='store_true',
+                       help='Use DeepSpeed FusedAdam as optimizer.')
     group.add_argument('--no-pipeline-parallel', action='store_true',
                        help='Disable pipeline parallelism')
     group.add_argument('--use-tutel', action='store_true',
@@ -1020,6 +1046,8 @@ def _add_checkpointing_args(parser):
                        help='Do not save current rng state.')
     group.add_argument('--load', type=str, default=None,
                        help='Directory containing a model checkpoint.')
+    group.add_argument('--load-tag', type=str, default=None,
+                       help='Specific checkpoint tag to load. Ignores latest.')
     group.add_argument('--no-load-optim', action='store_true', default=None,
                        help='Do not load optimizer when loading checkpoint.')
     group.add_argument('--no-load-rng', action='store_true', default=None,
@@ -1110,7 +1138,7 @@ def _add_distributed_args(parser):
                        help='overlap pipeline parallel communication with forward and backward chunks',
                        dest='overlap_p2p_comm')
     group.add_argument('--distributed-backend', default='nccl',
-                       choices=['nccl', 'gloo', 'ccl'],
+                       choices=['nccl', 'gloo', 'ccl', 'hccl'],
                        help='Which backend to use for distributed training.')
     group.add_argument('--distributed-timeout-minutes', type=int, default=10,
                        help='Timeout minutes for torch.distributed.')
@@ -1245,6 +1273,7 @@ def _add_data_args(parser):
                                 'GPT2BPETokenizer',
                                 'SentencePieceTokenizer',
                                 'GPTSentencePieceTokenizer',
+                                'HFTokenizer',
                                 'NullTokenizer'],
                        help='What type of tokenizer to use.')
     group.add_argument('--tokenizer-model', type=str, default=None,
@@ -1276,6 +1305,8 @@ def _add_data_args(parser):
                        help='Force to use certain index file.')
     group.add_argument('--train-shuffle-idx-path', type=str, default=None,
                        help='Force to use certain index file.')
+    group.add_argument('--repeated-dataloader', action='store_true',
+                       help='Once all the data has been loaded, reuse the DataLoader.')
     return parser
 
 

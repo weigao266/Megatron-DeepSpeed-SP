@@ -1,6 +1,6 @@
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
-"""Pretrain GPT"""
+"""Finetune LLAMA, Modified from pretrain_gpt.py"""
 
 import torch
 import math
@@ -12,6 +12,7 @@ from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
+from megatron.data.prompt_dataset import SupervisedDataset
 from megatron.model import GPTModel, GPTModelPipe
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
@@ -26,6 +27,7 @@ import subprocess
 
 from torch import nn
 import torch.nn.functional as F
+from transformers import AutoTokenizer
 
 
 def model_provider(pre_process=True, post_process=True):
@@ -36,15 +38,9 @@ def model_provider(pre_process=True, post_process=True):
 
     args = get_args()
     config = core_transformer_config_from_args(args)
-    if hasattr(mpu, 'get_sequence_data_parallel_group'):
-        dpg = mpu.get_sequence_data_parallel_group()
-    elif hasattr(mpu, 'get_data_parallel_group'):
-        dpg = mpu.get_data_parallel_group()
-    else:
-        dpg = None
-    with deepspeed.zero.Init(data_parallel_group=dpg,
+    with deepspeed.zero.Init(sequence_data_parallel_group=mpu.get_sequence_data_parallel_group(),
                              remote_device=None if args.remote_device == 'none' else args.remote_device,
-                             config_dict_or_path=args.deepspeed_config_dict,
+                             config_dict_or_path=args.deepspeed_config,
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
@@ -110,7 +106,6 @@ def get_batch(data_iterator):
     tokens_ = data_b['text'].long()
     labels = tokens_[:, 1:].contiguous()
     tokens = tokens_[:, :-1].contiguous()
-
     # Get the masks and postition ids.
     skip_mask = args.use_flash_attn or args.use_flash_attn_triton
     attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
@@ -175,24 +170,29 @@ def get_batch_pipe(data):
     tokenizer = get_tokenizer()
 
     # Items and their type.
-    keys = ['text']
+    keys = ['input_ids','labels']
     datatype = torch.int64
 
     # Broadcast data.
     data_b = tensor_parallel.broadcast_data(keys, data, datatype)
 
     # Unpack.
-    tokens_ = data_b['text'].long()
-    labels = tokens_[:, 1:].contiguous()
-    tokens = tokens_[:, :-1].contiguous()
+    # HF will automatically handle tokens alignment for labels, while in Megatron, we need to manually adjust it.
+    labels = data_b['labels'].long()[:,1:].contiguous()
+    tokens = data_b['input_ids'].long()[:,:-1].contiguous()
 
     # Get the masks and postition ids.
-    attention_mask, loss_mask, position_ids = get_ltor_masks_and_position_ids(
+    attention_mask, _, position_ids = get_ltor_masks_and_position_ids(
         tokens,
         tokenizer.eod,
         args.reset_position_ids,
         args.reset_attention_mask,
         args.eod_mask_loss)
+    
+    # mask loss for SFT training
+    # we use padding to fill the prompt in the labels
+    loss_mask = labels.ne(tokenizer.pad)
+
     if args.curriculum_learning_legacy and args.curriculum_seqlen < tokens.size()[1]:
         # seqlen-based curriculum learning
         # tokens, position_ids, labels, loss_mask have size [batch size, seqlen]
@@ -201,7 +201,7 @@ def get_batch_pipe(data):
         if labels is not None:
             labels = labels[:, :args.curriculum_seqlen].contiguous()
         loss_mask = loss_mask[:, :args.curriculum_seqlen].contiguous()
-
+    
     return (tokens, position_ids, attention_mask), (labels, loss_mask)
 
 
@@ -301,29 +301,19 @@ def forward_step(data_iterator, model):
     return output_tensor, partial(loss_func, loss_mask, moe_loss, mos_loss)
 
 
-def train_valid_test_datasets_provider(train_val_test_num_samples):
+def prompt_train_valid_test_datasets_provider(train_val_test_num_samples):
     """Build train, valid, and test datasets."""
     args = get_args()
 
-    print_rank_0('> building train, validation, and test datasets '
-                 'for GPT ...')
-    train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
-        data_prefix=args.data_path,
-        data_impl=args.data_impl,
-        splits_string=args.split,
-        train_valid_test_num_samples=train_val_test_num_samples,
-        seq_length=args.seq_length,
-        seed=args.seed,
-        skip_warmup=(not args.mmap_warmup),
-        train_data_prefix=args.train_data_path,
-        valid_data_prefix=args.valid_data_path,
-        test_data_prefix=args.test_data_path,
-        data_cache_path=args.data_cache_path)
-    print_rank_0("> finished creating GPT datasets ...")
+    print_rank_0('> building finetune prompt datasets '
+                 'for llama ...')
 
-    return train_ds, valid_ds, test_ds
-
-
+    tokenizer = get_tokenizer()
+    
+   # The finetune dataset is not large and defaults to using one file
+    train_ds = SupervisedDataset(args.data_path[0],tokenizer)
+    return train_ds, None ,None
+    
 def command_exists(cmd):
     result = subprocess.Popen(f'type {cmd}', stdout=subprocess.PIPE, shell=True)
     return result.wait() == 0
@@ -353,9 +343,8 @@ def git_ds_info():
 
 if __name__ == "__main__":
     git_ds_info()
-    pretrain(train_valid_test_datasets_provider,
+    pretrain(prompt_train_valid_test_datasets_provider,
              model_provider,
              ModelType.encoder_or_decoder,
              forward_step,
-             args_defaults={'tokenizer_type': 'GPT2BPETokenizer'},
              data_post_process=data_post_process)

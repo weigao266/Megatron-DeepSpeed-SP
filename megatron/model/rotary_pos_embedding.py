@@ -12,9 +12,9 @@ from torch import einsum, nn
 __all__ = ['RotaryEmbedding', 'apply_rotary_pos_emb']
 
 class RotaryEmbedding(nn.Module):
-    def __init__(self, dim):
+    def __init__(self, dim, theta=10000):
         super().__init__()
-        inv_freq = 1.0 / (10000 ** (torch.arange(0, dim, 2).float() / dim))
+        inv_freq = 1.0 / (theta ** (torch.arange(0, dim, 2).float() / dim))
         self.register_buffer('inv_freq', inv_freq)
         if importlib.util.find_spec('einops') is None:
             raise RuntimeError("einops is required for Rotary Embedding")
@@ -53,4 +53,4 @@ def apply_rotary_pos_emb(t, freqs):
     # first part is cosine component
     # second part is sine component, need to change signs with _rotate_half method
     t = (t * freqs.cos().to(t.dtype)) + (_rotate_half(t) * freqs.sin().to(t.dtype))
-    return torch.cat((t, t_pass), dim=-1)
+    return t if t_pass.shape[-1] == 0 else torch.cat((t, t_pass), dim=-1)

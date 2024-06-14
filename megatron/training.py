@@ -10,6 +10,7 @@ import json
 # The earliest we can measure the start time.
 _TRAIN_START_TIME = time.time()
 import torch
+from collections import OrderedDict
 from torch.nn.parallel.distributed import DistributedDataParallel as torchDDP
 
 from megatron import get_args
@@ -91,7 +92,8 @@ def pretrain(train_valid_test_dataset_provider,
              process_non_loss_data_func=None,
              extra_args_provider=None,
              args_defaults={},
-             data_post_process=None):
+             data_post_process=None,
+             external_args={}):
     """Main training program.
 
     This function will run the followings in the order provided:
@@ -123,7 +125,7 @@ def pretrain(train_valid_test_dataset_provider,
 
     # Initalize and get arguments, timers, and Tensorboard writer.
     initialize_megatron(extra_args_provider=extra_args_provider,
-                        args_defaults=args_defaults)
+                        args_defaults=args_defaults, external_args=external_args)
     # Set pytorch JIT layer fusion options and warmup JIT functions.
     if get_accelerator().device_name() == 'cuda':
         set_jit_fusion_options()
@@ -666,8 +668,13 @@ def train_step(forward_step_func, data_iterator,
         num_zeros_in_grad = 0
         assert isinstance(model[0], deepspeed.PipelineEngine)
         loss = model[0].train_batch(data_iter=data_iterator)
+        additional_losses = model[0].get_additional_losses()
+        loss_key = 'lm loss' if additional_losses is None else 'loss'  # use "lm loss" for backward compatibility
+        loss_dict = OrderedDict({loss_key: loss})
+        if additional_losses is not None:
+            loss_dict.update(additional_losses)
         grad_norm = model[0].get_global_grad_norm()
-        return {'lm loss' : loss}, skipped_iter, grad_norm, num_zeros_in_grad
+        return loss_dict, skipped_iter, grad_norm, num_zeros_in_grad
 
     # Set grad to zero.
     if not args.deepspeed:
@@ -880,7 +887,7 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                               args.consumed_train_samples)
             writer.add_scalar(f"lm-loss-training/{key}" + ' vs tokens', loss_dict[key],
                               args.consumed_train_tokens)
-        if args.fp16 and args.log_loss_scale_to_tensorboard:
+        if args.fp16 and loss_scale and args.log_loss_scale_to_tensorboard:
             writer.add_scalar('loss-scale/loss-scale', loss_scale, iteration)
             writer.add_scalar('loss-scale/loss-scale vs samples', loss_scale,
                               args.consumed_train_samples)
@@ -1038,7 +1045,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         tokens_per_gpu_per_second = tokens_per_sec / args.world_size
         tokens_per_gpu_per_second_per_replica = tokens_per_gpu_per_second / args.data_parallel_size
         if wandb is not None and getattr(wandb, 'run', None) is not None:
-            tput = {
+            assert wandb.run is not None
+            wandb_metrics = {
                 'throughput/iteration-time': elapsed_time_per_iteration,  # 1000 ms / s
                 'throughput/samples_per_sec': samples_per_sec,
                 'throughput/samples_per_sec_per_replica': samples_per_sec_per_replica,
@@ -1049,8 +1057,13 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 'throughput/tflops': tflops,
                 'throughput/approx_params_in_billions': approx_parameters_in_billions,
                 'throughput/elapsed_ms_per_iteration': elapsed_time_per_iteration,
+                'throughput/iteration': iteration,
             }
-            wandb.run.log(tput)
+            if loss_dict is not None:
+                wandb_metrics |= {
+                    f'loss/{k}': v for k, v in loss_dict.items()
+                }
+                wandb_metrics |= {'loss/iteration': iteration}
         if writer:
             if args.log_timers_to_tensorboard:
                 writer.add_scalar('iteration-time/iteration-time',
@@ -1069,6 +1082,21 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
             elapsed_time_per_iteration * 1000.0)
         log_string += ' learning rate: {:.3E} |'.format(learning_rate)
         log_string += ' global batch size: {:5d} |'.format(batch_size)
+        if wandb is not None and getattr(wandb, 'run', None) is not None:
+            wandb_metrics |= {
+                'training/iteration': iteration,
+                'training/iteration_time': elapsed_time_per_iteration,
+                'training/iteration_time_vs_tokens': (
+                    (elapsed_time_per_iteration
+                        / args.consumed_train_tokens)
+                ),
+                'training/iteration_time_vs_samples': (
+                    (elapsed_time_per_iteration
+                        / args.consumed_train_samples),
+                ),
+                'training/consumed_samples': args.consumed_train_samples,
+                'training/consumed_tokens': args.consumed_train_tokens,
+            }
         for key in total_loss_dict:
             if key not in [advanced_iters_key, skipped_iters_key,
                            nan_iters_key]:
@@ -1077,6 +1105,8 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
                 if avg > 0.0:
                     log_string += ' {}: {:.6E} |'.format(key, avg)
                 total_loss_dict[key] = get_accelerator().FloatTensor([0.0])
+        if wandb is not None and getattr(wandb, 'run', None) is not None:
+            wandb.log(wandb_metrics)
         if loss_scale is not None:
             log_string += ' loss scale: {:.1f} |'.format(loss_scale)
         if grad_norm is not None:
